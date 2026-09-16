@@ -10,3 +10,4 @@ build/
 Thumbs.db
 *.swp
 *.swo
+include/secrets.h

@@ -1,0 +1,12 @@
+# PlatformIO 构建产物
+.pio/
+build/
+
+# VS Code 项目配置和生成文件
+.vscode/
+
+# 操作系统和编辑器临时文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

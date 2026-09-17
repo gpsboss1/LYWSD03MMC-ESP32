@@ -17,7 +17,9 @@
 
 namespace {
 
-constexpr char kSensorMac[] = "aa:bb:cc:dd:ee:ff";
+constexpr char kSensorMacPrefix[] = "a4:c1:38:";
+constexpr uint16_t kMiBeaconServiceUuid = 0xfe95;
+constexpr uint16_t kEnvironmentalSensingServiceUuid = 0x181a;
 constexpr char kGattServiceUuid[] =
     "ebe0ccb0-7a0a-4b0c-8a1a-6ff2997da3a6";
 constexpr char kMeasurementCharacteristicUuid[] =
@@ -43,6 +45,8 @@ WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 Preferences preferences;
 bool targetSeen = false;
+std::string selectedSensorMac;
+int strongestSensorRssi = -127;
 bool autoUpdateEnabled = true;
 bool immediateMeasurementRequested = false;
 bool measurementPublishPending = false;
@@ -269,16 +273,17 @@ bool parseGattMeasurement(const std::string& value,
   return true;
 }
 
-// 主动连接原厂温湿度计并读取 GATT 温湿度特征值。
-bool readGattMeasurement(Measurement& measurement) {
-  Serial.printf("[GATT] connecting to %s...\n", kSensorMac);
+// 主动连接发现到的温湿度计并读取 GATT 温湿度特征值。
+bool readGattMeasurement(const std::string& sensorMac,
+                         Measurement& measurement) {
+  Serial.printf("[GATT] connecting to %s...\n", sensorMac.c_str());
   BLEClient* client = BLEDevice::createClient();
   if (client == nullptr) {
     Serial.println("[GATT] failed to create BLE client");
     return false;
   }
 
-  const bool connected = client->connect(BLEAddress(kSensorMac));
+  const bool connected = client->connect(BLEAddress(sensorMac));
   if (!connected) {
     Serial.println(
         "[GATT] connection failed; close Mi Home or other BLE apps if connected");
@@ -312,17 +317,53 @@ bool readGattMeasurement(Measurement& measurement) {
   return parsed;
 }
 
-// BLE 广播回调：确认目标设备在范围内。
+// 判断广播是否可能来自 LYWSD03MMC，减少误连接其他 BLE 设备的机会。
+bool isLikelySensorAdvertisement(BLEAdvertisedDevice& advertisedDevice) {
+  const std::string address = advertisedDevice.getAddress().toString();
+  if (address.rfind(kSensorMacPrefix, 0) == 0) {
+    return true;
+  }
+
+  if (advertisedDevice.haveServiceUUID() &&
+      advertisedDevice.isAdvertisingService(BLEUUID(kGattServiceUuid))) {
+    return true;
+  }
+
+  BLEUUID miBeaconUuid(kMiBeaconServiceUuid);
+  BLEUUID environmentalSensingUuid(kEnvironmentalSensingServiceUuid);
+  for (int index = 0; index < advertisedDevice.getServiceDataUUIDCount();
+       ++index) {
+    BLEUUID serviceDataUuid = advertisedDevice.getServiceDataUUID(index);
+    if (serviceDataUuid.equals(miBeaconUuid) ||
+        serviceDataUuid.equals(environmentalSensingUuid)) {
+      return true;
+    }
+  }
+
+  if (advertisedDevice.haveName()) {
+    const std::string name = advertisedDevice.getName();
+    return name.find("LYWSD03MMC") != std::string::npos;
+  }
+
+  return false;
+}
+
+// BLE 广播回调：记录 RSSI 最强的兼容温湿度计。
 class AdvertisementCallbacks final : public BLEAdvertisedDeviceCallbacks {
  public:
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    if (advertisedDevice.getAddress().toString() != kSensorMac) {
+    if (!isLikelySensorAdvertisement(advertisedDevice)) {
       return;
     }
 
-    targetSeen = true;
-    Serial.printf("[BLE] target seen, rssi=%d\n",
-                  advertisedDevice.getRSSI());
+    const int rssi = advertisedDevice.getRSSI();
+    if (!targetSeen || rssi > strongestSensorRssi) {
+      targetSeen = true;
+      strongestSensorRssi = rssi;
+      selectedSensorMac = advertisedDevice.getAddress().toString();
+      Serial.printf("[BLE] sensor candidate=%s, rssi=%d\n",
+                    selectedSensorMac.c_str(), strongestSensorRssi);
+    }
   }
 };
 
@@ -330,14 +371,18 @@ class AdvertisementCallbacks final : public BLEAdvertisedDeviceCallbacks {
 bool readSensorMeasurement(Measurement& measurement) {
   for (uint8_t attempt = 1; attempt <= kBleReadMaxAttempts; ++attempt) {
     targetSeen = false;
+    strongestSensorRssi = -127;
+    selectedSensorMac.clear();
     scanner->start(5, false);
 
     bool success = false;
     if (!targetSeen) {
-      Serial.printf("[BLE] target not seen, attempt %u/%u\n", attempt,
+      Serial.printf("[BLE] compatible sensor not seen, attempt %u/%u\n", attempt,
                     kBleReadMaxAttempts);
     } else {
-      success = readGattMeasurement(measurement);
+      Serial.printf("[BLE] strongest sensor=%s, rssi=%d\n",
+                    selectedSensorMac.c_str(), strongestSensorRssi);
+      success = readGattMeasurement(selectedSensorMac, measurement);
     }
 
     scanner->clearResults();
@@ -399,8 +444,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("MiTempHumid LYWSD03MMC Bafa Cloud gateway");
-  Serial.printf("Target MAC: %s\n", kSensorMac);
+  Serial.println("Mijia LYWSD03MMC ESP32-C3 Bemfa gateway");
+  Serial.println("Target sensor: strongest compatible BLE device");
   Serial.printf("Bafa topic: %s\n", BEMFA_TOPIC);
   Serial.println("BLE mode: active GATT read; bind key is not required.");
   loadSettings();

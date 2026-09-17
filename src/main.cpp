@@ -444,7 +444,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("Mijia LYWSD03MMC ESP32-C3 Bemfa gateway");
+  Serial.println("LYWSD03MMC-ESP32 gateway");
   Serial.println("Target sensor: strongest compatible BLE device");
   Serial.printf("Bafa topic: %s\n", BEMFA_TOPIC);
   Serial.println("BLE mode: active GATT read; bind key is not required.");

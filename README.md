@@ -1,5 +1,7 @@
 # 米家温湿度计 2（LYWSD03MMC）ESP32-C3 巴法云蓝牙网关
 
+Xiaomi Mijia Temperature and Humidity Monitor 2 (LYWSD03MMC) ESP32-C3 BLE to MQTT gateway for Bemfa Cloud.
+
 使用 ESP32-C3 连接米家温湿度计 2，并通过巴法云 MQTT 将温度、湿度和电池电压显示到手机 APP。
 
 本项目读取的是温湿度计的 GATT 特征值，不依赖小米绑定密钥。ESP32-C3 通过 Wi‑Fi 保持在线，按配置周期或 APP 命令读取传感器并上传数据。
@@ -45,7 +47,7 @@ PlatformIO 配置教程：[使用 VS Code 安装 PlatformIO 插件并创建项�
 ## 项目结构
 
 ```text
-mijia-lywsd03mmc-esp32c3-bemfa-gateway/
+LYWSD03MMC-ESP32/
 ├── include/
 │   ├── secrets.h.example   # 配置模板
 │   └── secrets.h           # 本地配置，不提交到 Git
@@ -83,15 +85,15 @@ mijia-lywsd03mmc-esp32c3-bemfa-gateway/
 
 6. 登录巴法云 APP 后设备会自动出现在主页。
 
-![巴法 APP 设备列表](docs/images/4.jpg)
+<img src="docs/images/4.jpg" alt="巴法 APP 设备列表" width="360">
 
 在设备详情页点击”单位设置“：
 
-![巴法 APP 温湿度计详情页](docs/images/5.jpg)
+<img src="docs/images/5.jpg" alt="巴法 APP 温湿度计详情页" width="360">
 
 将前 3 个单位分别设置为摄氏度、百分比和毫伏，后 2 个单位设置为无单位：
 
-![巴法 APP 单位设置](docs/images/6.jpg)
+<img src="docs/images/6.jpg" alt="巴法 APP 单位设置" width="360">
 
 巴法云相关文档：
 
@@ -136,15 +138,15 @@ Copy-Item include/secrets.h.example include/secrets.h
 
 在设备详情页点击右上角的设置按钮：
 
-![巴法 APP 进入设备设置](docs/images/7.jpg)
+<img src="docs/images/7.jpg" alt="巴法 APP 进入设备设置" width="360">
 
 进入设置页面后选择“调试发送”：
 
-![巴法 APP 进入调试发送](docs/images/8.jpg)
+<img src="docs/images/8.jpg" alt="巴法 APP 进入调试发送" width="360">
 
 在“消息内容”中输入命令，然后点击“发送消息”：
 
-![巴法 APP 发送自定义命令](docs/images/9.jpg)
+<img src="docs/images/9.jpg" alt="巴法 APP 发送自定义命令" width="360">
 
 | 命令 | 作用 |
 | --- | --- |

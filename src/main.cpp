@@ -45,7 +45,9 @@ Preferences preferences;
 bool targetSeen = false;
 bool autoUpdateEnabled = true;
 bool immediateMeasurementRequested = false;
+bool measurementPublishPending = false;
 uint32_t measurementIntervalMinutes = kDefaultMeasurementIntervalMinutes;
+Measurement pendingMeasurement;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastMeasurement = 0;
 
@@ -89,14 +91,14 @@ void loadSettings() {
   }
 }
 
-// 解析 Interval:分钟数命令，并检查数值范围和尾随字符。
-bool parseIntervalCommand(const char* command, uint32_t& minutes) {
-  constexpr char kIntervalPrefix[] = "Interval:";
-  if (strncmp(command, kIntervalPrefix, strlen(kIntervalPrefix)) != 0) {
+// 解析 Every:分钟数命令，并检查数值范围和尾随字符。
+bool parseEveryCommand(const char* command, uint32_t& minutes) {
+  constexpr char kEveryPrefix[] = "Every:";
+  if (strncmp(command, kEveryPrefix, strlen(kEveryPrefix)) != 0) {
     return false;
   }
 
-  const char* valueStart = command + strlen(kIntervalPrefix);
+  const char* valueStart = command + strlen(kEveryPrefix);
   if (*valueStart == '\0') {
     return false;
   }
@@ -159,7 +161,7 @@ void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
   }
 
   uint32_t requestedIntervalMinutes = 0;
-  if (parseIntervalCommand(command, requestedIntervalMinutes)) {
+  if (parseEveryCommand(command, requestedIntervalMinutes)) {
     measurementIntervalMinutes = requestedIntervalMinutes;
     lastMeasurement = millis();
     requestImmediateMeasurement();
@@ -358,26 +360,36 @@ bool readSensorMeasurement(Measurement& measurement) {
   return false;
 }
 
-// 按巴法云传感器格式上传温度、湿度、电压和当前配置，只更新云端最新值。
+// 按巴法云传感器格式上传温度、湿度、电压、Auto 状态和 Every 间隔。
 bool publishMeasurement(const Measurement& measurement) {
   if (!mqttClient.connected()) {
+    Serial.println("[MQTT] publish skipped, not connected");
     return false;
   }
 
   char topic[80] = {};
   snprintf(topic, sizeof(topic), "%s/up", BEMFA_TOPIC);
-  char configuration[40] = {};
-  snprintf(configuration, sizeof(configuration), "Auto:%s,Interval:%lu",
-           autoUpdateEnabled ? "on" : "off",
-           static_cast<unsigned long>(measurementIntervalMinutes));
   char payload[96] = {};
-  snprintf(payload, sizeof(payload), "#%.1f#%u#%u#%s", measurement.temperatureC,
-           measurement.humidity, measurement.batteryMillivolts, configuration);
+  snprintf(payload, sizeof(payload), "#%.1f#%u#%u#Auto %s#Every %lu",
+           measurement.temperatureC, measurement.humidity,
+           measurement.batteryMillivolts, autoUpdateEnabled ? "on" : "off",
+           static_cast<unsigned long>(measurementIntervalMinutes));
 
   const bool published = mqttClient.publish(topic, payload, true);
   Serial.printf("[MQTT] publish topic=%s payload=%s result=%s\n", topic,
                 payload, published ? "ok" : "failed");
   return published;
+}
+
+// MQTT 重连后补发读取期间暂存的最新测量值。
+void publishPendingMeasurement() {
+  if (!measurementPublishPending || !mqttClient.connected()) {
+    return;
+  }
+
+  if (publishMeasurement(pendingMeasurement)) {
+    measurementPublishPending = false;
+  }
 }
 
 }  // namespace
@@ -412,6 +424,7 @@ void setup() {
 void loop() {
   ensureMqttConnected();
   mqttClient.loop();
+  publishPendingMeasurement();
 
   const unsigned long intervalMs =
       static_cast<unsigned long>(measurementIntervalMinutes) * 60000UL;
@@ -423,7 +436,9 @@ void loop() {
     lastMeasurement = millis();
     Measurement measurement;
     if (readSensorMeasurement(measurement)) {
-      publishMeasurement(measurement);
+      pendingMeasurement = measurement;
+      measurementPublishPending = true;
+      publishPendingMeasurement();
     }
   }
 

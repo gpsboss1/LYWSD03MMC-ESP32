@@ -5,9 +5,12 @@
 #include <BLEScan.h>
 #include <BLERemoteCharacteristic.h>
 #include <BLERemoteService.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "secrets.h"
@@ -23,7 +26,11 @@ constexpr char kBafaMqttHost[] = "bemfa.com";
 constexpr uint16_t kBafaMqttPort = 9501;
 constexpr unsigned long kWifiConnectTimeoutMs = 20000UL;
 constexpr unsigned long kMqttRetryIntervalMs = 5000UL;
-constexpr unsigned long kMeasurementIntervalMs = 600000UL;
+constexpr uint32_t kDefaultMeasurementIntervalMinutes = 60U;
+constexpr uint32_t kMinimumMeasurementIntervalMinutes = 1U;
+constexpr uint32_t kMaximumMeasurementIntervalMinutes = 1440U;
+constexpr uint8_t kBleReadMaxAttempts = 3U;
+constexpr unsigned long kBleRetryDelayMs = 1000UL;
 
 struct Measurement {
   float temperatureC = 0.0F;
@@ -34,9 +41,150 @@ struct Measurement {
 BLEScan* scanner = nullptr;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+Preferences preferences;
 bool targetSeen = false;
+bool autoUpdateEnabled = true;
+bool immediateMeasurementRequested = false;
+uint32_t measurementIntervalMinutes = kDefaultMeasurementIntervalMinutes;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastMeasurement = 0;
+
+// 将命令字符串首尾的空白字符移除，兼容 APP 自动附加的换行。
+void trimCommand(char* command) {
+  size_t start = 0;
+  while (command[start] == ' ' || command[start] == '\t' ||
+         command[start] == '\r' || command[start] == '\n') {
+    ++start;
+  }
+
+  if (start > 0) {
+    memmove(command, command + start, strlen(command + start) + 1);
+  }
+
+  size_t length = strlen(command);
+  while (length > 0 &&
+         (command[length - 1] == ' ' || command[length - 1] == '\t' ||
+          command[length - 1] == '\r' || command[length - 1] == '\n')) {
+    command[--length] = '\0';
+  }
+}
+
+// 将自动更新设置保存到 NVS，设备重启后仍保留用户配置。
+void saveSettings() {
+  preferences.putBool("auto", autoUpdateEnabled);
+  preferences.putUInt("interval", measurementIntervalMinutes);
+}
+
+// 从 NVS 读取自动更新设置，异常值恢复为安全的默认配置。
+void loadSettings() {
+  preferences.begin("settings", false);
+  autoUpdateEnabled = preferences.getBool("auto", true);
+  measurementIntervalMinutes =
+      preferences.getUInt("interval", kDefaultMeasurementIntervalMinutes);
+
+  if (measurementIntervalMinutes < kMinimumMeasurementIntervalMinutes ||
+      measurementIntervalMinutes > kMaximumMeasurementIntervalMinutes) {
+    measurementIntervalMinutes = kDefaultMeasurementIntervalMinutes;
+    saveSettings();
+  }
+}
+
+// 解析 Interval:分钟数命令，并检查数值范围和尾随字符。
+bool parseIntervalCommand(const char* command, uint32_t& minutes) {
+  constexpr char kIntervalPrefix[] = "Interval:";
+  if (strncmp(command, kIntervalPrefix, strlen(kIntervalPrefix)) != 0) {
+    return false;
+  }
+
+  const char* valueStart = command + strlen(kIntervalPrefix);
+  if (*valueStart == '\0') {
+    return false;
+  }
+
+  char* valueEnd = nullptr;
+  const unsigned long parsed = strtoul(valueStart, &valueEnd, 10);
+  if (*valueEnd != '\0' || parsed < kMinimumMeasurementIntervalMinutes ||
+      parsed > kMaximumMeasurementIntervalMinutes) {
+    return false;
+  }
+
+  minutes = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+// 请求立即读取一次传感器，供 MQTT 命令统一触发即时回传。
+void requestImmediateMeasurement() {
+  immediateMeasurementRequested = true;
+}
+
+// 忽略设备自己发布的 /up 数据，避免把传感器数据误判为控制命令。
+bool isMeasurementTopic(const char* topic) {
+  char measurementTopic[80] = {};
+  snprintf(measurementTopic, sizeof(measurementTopic), "%s/up", BEMFA_TOPIC);
+  return strcmp(topic, measurementTopic) == 0;
+}
+
+// 接收巴法云自定义消息，只更新控制状态，避免在 MQTT 回调中执行 BLE 操作。
+void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
+  if (isMeasurementTopic(topic)) {
+    return;
+  }
+
+  constexpr size_t kCommandBufferSize = 48;
+  if (length >= kCommandBufferSize) {
+    Serial.printf("[CMD] command too long, length=%u\n", length);
+    return;
+  }
+
+  char command[kCommandBufferSize] = {};
+  memcpy(command, payload, length);
+  command[length] = '\0';
+  trimCommand(command);
+  Serial.printf("[CMD] topic=%s command=%s\n", topic, command);
+
+  if (strcmp(command, "Auto:on") == 0) {
+    autoUpdateEnabled = true;
+    requestImmediateMeasurement();
+    saveSettings();
+    Serial.println("[CMD] automatic updates enabled");
+    return;
+  }
+
+  if (strcmp(command, "Auto:off") == 0) {
+    autoUpdateEnabled = false;
+    requestImmediateMeasurement();
+    saveSettings();
+    Serial.println("[CMD] automatic updates disabled");
+    return;
+  }
+
+  uint32_t requestedIntervalMinutes = 0;
+  if (parseIntervalCommand(command, requestedIntervalMinutes)) {
+    measurementIntervalMinutes = requestedIntervalMinutes;
+    lastMeasurement = millis();
+    requestImmediateMeasurement();
+    saveSettings();
+    Serial.printf("[CMD] update interval=%lu minutes\n",
+                  static_cast<unsigned long>(measurementIntervalMinutes));
+    return;
+  }
+
+  if (strcmp(command, "Update") == 0) {
+    requestImmediateMeasurement();
+    Serial.println("[CMD] one-shot update requested");
+    return;
+  }
+
+  if (strcmp(command, "Status") == 0) {
+    requestImmediateMeasurement();
+    Serial.printf("[CMD] status auto=%s interval=%lu minutes\n",
+                  autoUpdateEnabled ? "on" : "off",
+                  static_cast<unsigned long>(measurementIntervalMinutes));
+    return;
+  }
+
+  Serial.println("[CMD] unknown command");
+}
 
 // 连接本地 WiFi，并在超时后返回，让主循环继续运行。
 bool ensureWifiConnected() {
@@ -87,6 +235,15 @@ bool ensureMqttConnected() {
   }
 
   Serial.println("[MQTT] connected");
+  const bool subscribed = mqttClient.subscribe(BEMFA_TOPIC);
+  Serial.printf("[MQTT] subscribe topic=%s result=%s\n", BEMFA_TOPIC,
+                subscribed ? "ok" : "failed");
+
+  char commandTopic[80] = {};
+  snprintf(commandTopic, sizeof(commandTopic), "%s/set", BEMFA_TOPIC);
+  const bool setSubscribed = mqttClient.subscribe(commandTopic);
+  Serial.printf("[MQTT] subscribe topic=%s result=%s\n", commandTopic,
+                setSubscribed ? "ok" : "failed");
   return true;
 }
 
@@ -169,26 +326,39 @@ class AdvertisementCallbacks final : public BLEAdvertisedDeviceCallbacks {
 
 // 扫描并读取一次米家温湿度计。
 bool readSensorMeasurement(Measurement& measurement) {
-  targetSeen = false;
-  scanner->start(5, false);
+  for (uint8_t attempt = 1; attempt <= kBleReadMaxAttempts; ++attempt) {
+    targetSeen = false;
+    scanner->start(5, false);
 
-  if (!targetSeen) {
+    bool success = false;
+    if (!targetSeen) {
+      Serial.printf("[BLE] target not seen, attempt %u/%u\n", attempt,
+                    kBleReadMaxAttempts);
+    } else {
+      success = readGattMeasurement(measurement);
+    }
+
     scanner->clearResults();
-    Serial.println("[BLE] target not seen in the latest scan");
-    return false;
+    if (success) {
+      Serial.printf(
+          "[MEASUREMENT] temperature=%.1fC humidity=%u%% battery=%umV\n",
+          measurement.temperatureC, measurement.humidity,
+          measurement.batteryMillivolts);
+      return true;
+    }
+
+    if (attempt < kBleReadMaxAttempts) {
+      Serial.printf("[BLE] read failed, retrying in %lu ms\n",
+                    kBleRetryDelayMs);
+      delay(kBleRetryDelayMs);
+    }
   }
 
-  const bool success = readGattMeasurement(measurement);
-  scanner->clearResults();
-  if (success) {
-    Serial.printf("[MEASUREMENT] temperature=%.1fC humidity=%u%% battery=%umV\n",
-                  measurement.temperatureC, measurement.humidity,
-                  measurement.batteryMillivolts);
-  }
-  return success;
+  Serial.println("[BLE] all read attempts failed");
+  return false;
 }
 
-// 按巴法云传感器格式上传温度、湿度和电压，只更新云端最新值。
+// 按巴法云传感器格式上传温度、湿度、电压和当前配置，只更新云端最新值。
 bool publishMeasurement(const Measurement& measurement) {
   if (!mqttClient.connected()) {
     return false;
@@ -196,9 +366,13 @@ bool publishMeasurement(const Measurement& measurement) {
 
   char topic[80] = {};
   snprintf(topic, sizeof(topic), "%s/up", BEMFA_TOPIC);
-  char payload[48] = {};
-  snprintf(payload, sizeof(payload), "#%.1f#%u#%u", measurement.temperatureC,
-           measurement.humidity, measurement.batteryMillivolts);
+  char configuration[40] = {};
+  snprintf(configuration, sizeof(configuration), "Auto:%s,Interval:%lu",
+           autoUpdateEnabled ? "on" : "off",
+           static_cast<unsigned long>(measurementIntervalMinutes));
+  char payload[96] = {};
+  snprintf(payload, sizeof(payload), "#%.1f#%u#%u#%s", measurement.temperatureC,
+           measurement.humidity, measurement.batteryMillivolts, configuration);
 
   const bool published = mqttClient.publish(topic, payload, true);
   Serial.printf("[MQTT] publish topic=%s payload=%s result=%s\n", topic,
@@ -217,8 +391,13 @@ void setup() {
   Serial.printf("Target MAC: %s\n", kSensorMac);
   Serial.printf("Bafa topic: %s\n", BEMFA_TOPIC);
   Serial.println("BLE mode: active GATT read; bind key is not required.");
+  loadSettings();
+  Serial.printf("Auto update: %s, interval=%lu minutes\n",
+                autoUpdateEnabled ? "on" : "off",
+                static_cast<unsigned long>(measurementIntervalMinutes));
 
   mqttClient.setServer(kBafaMqttHost, kBafaMqttPort);
+  mqttClient.setCallback(onMqttMessage);
   mqttClient.setBufferSize(128);
 
   BLEDevice::init("");
@@ -229,14 +408,18 @@ void setup() {
   scanner->setWindow(80);
 }
 
-// 保持云端连接，并每 10 分钟读取一次传感器后上传。
+// 保持云端连接，并按照命令配置定时或按需读取传感器后上传。
 void loop() {
   ensureMqttConnected();
   mqttClient.loop();
 
-  if (scanner != nullptr &&
-      (lastMeasurement == 0 ||
-       millis() - lastMeasurement >= kMeasurementIntervalMs)) {
+  const unsigned long intervalMs =
+      static_cast<unsigned long>(measurementIntervalMinutes) * 60000UL;
+  const bool intervalDue =
+      autoUpdateEnabled &&
+      (lastMeasurement == 0 || millis() - lastMeasurement >= intervalMs);
+  if (scanner != nullptr && (immediateMeasurementRequested || intervalDue)) {
+    immediateMeasurementRequested = false;
     lastMeasurement = millis();
     Measurement measurement;
     if (readSensorMeasurement(measurement)) {
@@ -246,8 +429,3 @@ void loop() {
 
   delay(20);
 }
-
-
-
-
-
